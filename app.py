@@ -6,7 +6,6 @@ import hashlib
 import base64
 import asyncio
 import datetime as dt
-import audioop
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
