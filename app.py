@@ -237,17 +237,61 @@ class OpenAIRealtimeClient:
 
 
 # =========================
-# Audio helpers (8k <-> 24k)
+# Audio helpers (8k <-> 24k) — Python 3.13 safe
 # =========================
 
+from array import array
+
+def _clamp_int16(x: int) -> int:
+    if x > 32767:
+        return 32767
+    if x < -32768:
+        return -32768
+    return x
+
+def resample_pcm16_mono(pcm16: bytes, in_rate: int, out_rate: int) -> bytes:
+    """
+    Linear interpolation resampler for 16-bit signed mono PCM.
+    Works on Python 3.13+ (no audioop dependency).
+    """
+    if in_rate == out_rate or not pcm16:
+        return pcm16
+
+    samples = array("h")
+    samples.frombytes(pcm16)
+
+    n_in = len(samples)
+    if n_in < 2:
+        return pcm16
+
+    ratio = in_rate / out_rate
+    n_out = int(round(n_in * (out_rate / in_rate)))
+    if n_out < 2:
+        n_out = 2
+
+    out = array("h", [0]) * n_out
+
+    for i in range(n_out):
+        src = i * ratio
+        j = int(src)
+        frac = src - j
+
+        if j >= n_in - 1:
+            s = samples[n_in - 1]
+        else:
+            a = samples[j]
+            b = samples[j + 1]
+            s = int(a + (b - a) * frac)
+
+        out[i] = _clamp_int16(s)
+
+    return out.tobytes()
+
 def pcm16_8k_to_24k(pcm16_8k: bytes) -> bytes:
-    converted, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
-    return converted
+    return resample_pcm16_mono(pcm16_8k, 8000, 24000)
 
 def pcm16_24k_to_8k(pcm16_24k: bytes) -> bytes:
-    converted, _ = audioop.ratecv(pcm16_24k, 2, 1, 24000, 8000, None)
-    return converted
-
+    return resample_pcm16_mono(pcm16_24k, 24000, 8000)
 
 # =========================
 # Exotel session bridge
