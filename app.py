@@ -460,8 +460,14 @@ def list_tenants(db: Session = Depends(get_db), x_admin_key: str | None = Header
 # =========================
 
 @app.get("/exotel/ws-bootstrap")
-def exotel_ws_bootstrap(to: str | None = None, To: str | None = None):
-    target = (to or To or "").strip()
+def exotel_ws_bootstrap(
+    to: str | None = None,
+    To: str | None = None,
+    CallTo: str | None = None,
+    callto: str | None = None,
+):
+    # Exotel may send called number as To, CallTo, or lowercase variants depending on applet/flow.
+    target = (to or To or CallTo or callto or "").strip()
 
     if not settings.BASE_URL:
         raise HTTPException(500, "BASE_URL not set (needed so Exotel can reach your WSS endpoint)")
@@ -485,8 +491,7 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
     if to_norm:
         tenant = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_norm).first()
 
-    # DEBUG: confirm WS tenant resolution
-    print("WS connected: to=", to_norm, "tenant=", tenant.id if tenant else None)
+    print("WS connected: to=", to_norm, "tenant=", tenant.id if tenant else None, flush=True)
 
     if not tenant:
         await websocket.send_text(json.dumps({"event": "error", "message": "Unknown tenant (missing/invalid to=)"}))
