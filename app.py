@@ -29,7 +29,7 @@ class Settings:
     BASE_URL: str = os.getenv("BASE_URL", "").rstrip("/")  # https://your-service.onrender.com
     PORT: int = int(os.getenv("PORT", "8000"))
 
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
+    DATABASE_URL: str = os.getenv("DATABASE_URL") or "sqlite:///./dev.db"
 
     JWT_SECRET: str = os.getenv("JWT_SECRET", "change-me")
     JWT_ISSUER: str = os.getenv("JWT_ISSUER", "ai-receptionist")
@@ -474,7 +474,7 @@ def exotel_ws_bootstrap(
 
     # Exotel calls HTTPS bootstrap and expects {"url":"wss://..."}.
     wss_base = settings.BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
-    wss = f"{wss_base}/ws/exotel?to={target}"
+    wss = f"{wss_base}/ws/exotel/{target}"
     return {"url": wss}
 
 
@@ -482,14 +482,115 @@ def exotel_ws_bootstrap(
 # Exotel WebSocket endpoint
 # =========================
 
+
+# =========================
+# Exotel WebSocket endpoint (PATH-based tenant routing)
+# =========================
+@app.websocket("/ws/exotel/{to_number}")
+async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Depends(get_db)):
+    await websocket.accept()
+
+    to_norm = (to_number or "").strip()
+    tenant = None
+    if to_norm:
+        tenant = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_norm).first()
+
+    print("WS connected: to=", to_norm, "tenant=", tenant.id if tenant else None, flush=True)
+
+    if not tenant:
+        await websocket.send_text(json.dumps({"event": "error", "message": "Unknown tenant (invalid to_number path)"}))
+        await websocket.close()
+        return
+
+    session = ExotelSession(websocket=websocket, db=db, tenant=tenant)
+    try:
+        await session.start()
+    except Exception as e:
+        await websocket.send_text(json.dumps({"event": "error", "message": f"AI session init failed: {e}"}))
+        await websocket.close()
+        return
+
+    try:
+        while True:
+            msg = await websocket.receive()
+
+            raw = None
+            if "text" in msg and msg["text"] is not None:
+                raw = msg["text"]
+            elif "bytes" in msg and msg["bytes"] is not None:
+                try:
+                    raw = msg["bytes"].decode("utf-8", errors="ignore")
+                except Exception:
+                    raw = None
+
+            if not raw:
+                continue
+
+            print("WS IN event (first 200 chars):", raw[:200], flush=True)
+
+            try:
+                event = json.loads(raw)
+            except Exception:
+                print("WS non-JSON payload (ignored)", flush=True)
+                continue
+
+            await session.handle_event(event)
+    except WebSocketDisconnect:
+        await session.finish(status="disconnected")
+    except Exception:
+        await session.finish(status="error")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.websocket("/ws/exotel")
 async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(get_db)):
     await websocket.accept()
 
+    # Try resolve tenant from querystring first (to=...)
     tenant = None
     to_norm = (to or "").strip()
     if to_norm:
         tenant = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_norm).first()
+
+    # If missing, attempt to resolve from the first WS message (some Exotel stream setups don't pass query params)
+    if not tenant:
+        try:
+            first = await websocket.receive()
+            raw = None
+            if "text" in first and first["text"] is not None:
+                raw = first["text"]
+            elif "bytes" in first and first["bytes"] is not None:
+                try:
+                    raw = first["bytes"].decode("utf-8", errors="ignore")
+                except Exception:
+                    raw = None
+
+            if raw:
+                # DEBUG: capture first payload for troubleshooting
+                print("WS first payload (first 200 chars):", raw[:200], flush=True)
+                try:
+                    evt = json.loads(raw)
+                except Exception:
+                    evt = {}
+
+                # Try common locations for called number
+                meta = evt.get("start") or evt.get("data") or evt.get("connected") or evt
+                to_from_msg = (
+                    meta.get("to") or meta.get("to_number") or meta.get("CallTo") or meta.get("To") or meta.get("called") or ""
+                )
+                to_norm = str(to_from_msg).strip() or to_norm
+                if to_norm:
+                    tenant = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_norm).first()
+
+                # If we consumed the first message and it was JSON, also process it after session starts.
+                first_event = evt if isinstance(evt, dict) else None
+            else:
+                first_event = None
+        except Exception:
+            first_event = None
 
     print("WS connected: to=", to_norm, "tenant=", tenant.id if tenant else None, flush=True)
 
@@ -505,6 +606,13 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
         await websocket.send_text(json.dumps({"event": "error", "message": f"AI session init failed: {e}"}))
         await websocket.close()
         return
+
+    # If we had to read the first WS message to resolve the tenant, process it now.
+    if 'first_event' in locals() and first_event:
+        try:
+            await session.handle_event(first_event)
+        except Exception:
+            pass
 
     try:
         while True:
