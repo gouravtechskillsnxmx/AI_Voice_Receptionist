@@ -416,7 +416,7 @@ class ExotelSession:
 
     async def _flush_outbuf_if_ready(self):
         # Exotel wants chunk sizes multiple of 320 bytes; typical 100ms at 8kHz PCM16 ≈ 3200 bytes.
-        target = 3200
+        target = 320
         while len(self._outbuf) >= target:
             chunk = bytes(self._outbuf[:target])
             del self._outbuf[:target]
