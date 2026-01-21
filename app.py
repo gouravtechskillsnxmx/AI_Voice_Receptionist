@@ -306,8 +306,32 @@ class ExotelSession:
         self.openai = OpenAIRealtimeClient()
         self._ai_started = False  # lazy-start OpenAI after Exotel 'start' to avoid early disconnects
 
+        self._ai_task: Optional[asyncio.Task] = None
+        self._ai_ready = asyncio.Event()
+        self._pre_audio = bytearray()  # buffer caller audio until AI is ready
+
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
+
+
+    async def _ensure_ai_started(self, reason: str):
+        """Start OpenAI session in background without blocking Exotel WS receive loop."""
+        if self._ai_task and not self._ai_task.done():
+            return
+        self._ai_started = True
+
+        async def _runner():
+            try:
+                await self.start()
+                self._ai_ready.set()
+                print(f"AI session started ({reason})", flush=True)
+            except Exception as e:
+                print(f"AI session init failed ({reason}):", repr(e), flush=True)
+                # Mark ready to avoid buffering forever; then finish.
+                self._ai_ready.set()
+                await self.finish(status="ai_init_failed")
+
+        self._ai_task = asyncio.create_task(_runner())
 
     async def start(self):
         async def on_audio_delta(pcm16_24k: bytes):
@@ -333,18 +357,12 @@ class ExotelSession:
         await self.openai.connect(system_prompt=prompt)
 
     async def handle_event(self, event: dict):
-        et = (event.get("event") or event.get("type") or "").lower()
-        # Lazy-start OpenAI session only after Exotel stream is ready.
-        # This prevents Exotel from disconnecting if OpenAI connect takes ~1-2s.
-        if et in ("start", "connected") and not self._ai_started:
-            self._ai_started = True
-            try:
-                await self.start()
-                print("AI session started", flush=True)
-            except Exception as e:
-                print("AI session init failed:", repr(e), flush=True)
-                await self.finish(status="ai_init_failed")
-                return
+        et = (event.get("event") or event.get("type") or "").lower()        # Start OpenAI session as early as possible WITHOUT blocking the Exotel WS receive loop.
+        # Exotel typically sends: connected -> start -> media. If we block here, Exotel may hang up quickly.
+        if et == "connected" and not self._ai_started:
+            await self._ensure_ai_started("connected")
+        elif et == "start" and not self._ai_started:
+            await self._ensure_ai_started("start")
 
 
         if et in ("start", "connected"):
@@ -374,6 +392,19 @@ class ExotelSession:
 
             pcm16_8k = base64.b64decode(payload)
             pcm16_24k = pcm16_8k_to_24k(pcm16_8k)
+
+            # If OpenAI isn't ready yet, buffer a little caller audio (avoid losing first words).
+            if not self._ai_ready.is_set():
+                if len(self._pre_audio) < 32000:  # ~2s @ 8kHz PCM16 mono
+                    self._pre_audio.extend(pcm16_8k)
+                return
+
+            # Flush buffered audio once AI is ready
+            if self._pre_audio:
+                buffered = bytes(self._pre_audio)
+                self._pre_audio.clear()
+                await self.openai.send_audio_pcm16_24k(pcm16_8k_to_24k(buffered))
+
             await self.openai.send_audio_pcm16_24k(pcm16_24k)
 
         elif et in ("stop", "hangup", "end"):
