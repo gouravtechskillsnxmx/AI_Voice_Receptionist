@@ -485,6 +485,9 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
     if to_norm:
         tenant = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_norm).first()
 
+    # DEBUG: confirm WS tenant resolution
+    print("WS connected: to=", to_norm, "tenant=", tenant.id if tenant else None)
+
     if not tenant:
         await websocket.send_text(json.dumps({"event": "error", "message": "Unknown tenant (missing/invalid to=)"}))
         await websocket.close()
@@ -500,11 +503,29 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
 
     try:
         while True:
-            raw = await websocket.receive_text()
+            msg = await websocket.receive()
+
+            raw = None
+            if "text" in msg and msg["text"] is not None:
+                raw = msg["text"]
+            elif "bytes" in msg and msg["bytes"] is not None:
+                try:
+                    raw = msg["bytes"].decode("utf-8", errors="ignore")
+                except Exception:
+                    raw = None
+
+            if not raw:
+                continue
+
+            # DEBUG: see what Exotel actually sends
+            print("WS IN event (first 200 chars):", raw[:200])
+
             try:
                 event = json.loads(raw)
             except Exception:
+                print("WS non-JSON payload (ignored)")
                 continue
+
             await session.handle_event(event)
     except WebSocketDisconnect:
         await session.finish(status="disconnected")
