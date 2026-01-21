@@ -304,6 +304,7 @@ class ExotelSession:
 
         self.call: Optional[Call] = None
         self.openai = OpenAIRealtimeClient()
+        self._ai_started = False  # lazy-start OpenAI after Exotel 'start' to avoid early disconnects
 
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
@@ -333,6 +334,18 @@ class ExotelSession:
 
     async def handle_event(self, event: dict):
         et = (event.get("event") or event.get("type") or "").lower()
+        # Lazy-start OpenAI session only after Exotel stream is ready.
+        # This prevents Exotel from disconnecting if OpenAI connect takes ~1-2s.
+        if et in ("start", "connected") and not self._ai_started:
+            self._ai_started = True
+            try:
+                await self.start()
+                print("AI session started", flush=True)
+            except Exception as e:
+                print("AI session init failed:", repr(e), flush=True)
+                await self.finish(status="ai_init_failed")
+                return
+
 
         if et in ("start", "connected"):
             meta = event.get("start") or event.get("data") or event.get("connected") or event
@@ -503,12 +516,6 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
         return
 
     session = ExotelSession(websocket=websocket, db=db, tenant=tenant)
-    try:
-        await session.start()
-    except Exception as e:
-        await websocket.send_text(json.dumps({"event": "error", "message": f"AI session init failed: {e}"}))
-        await websocket.close()
-        return
 
     try:
         while True:
@@ -600,12 +607,6 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
         return
 
     session = ExotelSession(websocket=websocket, db=db, tenant=tenant)
-    try:
-        await session.start()
-    except Exception as e:
-        await websocket.send_text(json.dumps({"event": "error", "message": f"AI session init failed: {e}"}))
-        await websocket.close()
-        return
 
     # If we had to read the first WS message to resolve the tenant, process it now.
     if 'first_event' in locals() and first_event:
