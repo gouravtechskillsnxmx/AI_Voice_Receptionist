@@ -469,35 +469,35 @@ class ExotelSession:
 
 
 
-async def _send_pcm16_8k(self, pcm16_8k: bytes):
-    """Queue outbound 8kHz PCM16 audio to Exotel stream."""
-    async with self._out_lock:
-        self._outbuf.extend(pcm16_8k)
-        await self._flush_outbuf_if_ready()
+    async def _send_pcm16_8k(self, pcm16_8k: bytes):
+        """Queue outbound 8kHz PCM16 audio to Exotel stream."""
+        async with self._out_lock:
+            self._outbuf.extend(pcm16_8k)
+            await self._flush_outbuf_if_ready()
 
-async def _send_initial_greeting(self):
-    """Send an immediate greeting to Exotel to break the no-audio deadlock.
+    async def _send_initial_greeting(self):
+        """Send an immediate greeting to Exotel to break the no-audio deadlock.
 
-    Exotel may not start sending inbound 'media' until it receives outbound audio.
-    We synthesize a short greeting using OpenAI TTS (PCM 24k) and downsample to 8k.
-    """
-    if self._greeted:
-        return
-    self._greeted = True
+        Exotel may not start sending inbound 'media' until it receives outbound audio.
+        We synthesize a short greeting using OpenAI TTS (PCM 24k) and downsample to 8k.
+        """
+        if self._greeted:
+            return
+        self._greeted = True
 
-    # Decide greeting text: prefer tenant prompt override later; for now use env.
-    greeting_text = (getattr(settings, "OPENAI_TTS_GREETING", "") or "").strip() or "Hello. How can I help you today?"
+        # Decide greeting text: prefer tenant prompt override later; for now use env.
+        greeting_text = (getattr(settings, "OPENAI_TTS_GREETING", "") or "").strip() or "Hello. How can I help you today?"
 
-    try:
-        pcm24 = openai_tts_pcm16_24k(greeting_text)
-        pcm8 = pcm16_24k_to_8k(pcm24)
+        try:
+            pcm24 = openai_tts_pcm16_24k(greeting_text)
+            pcm8 = pcm16_24k_to_8k(pcm24)
 
-        # Some Exotel setups are sensitive to the first packet timing/size.
-        # Send in small multiples of 320 bytes.
-        await self._send_pcm16_8k(pcm8)
-    except Exception as e:
-        # Do not crash the call if greeting fails.
-        print("Greeting TTS failed:", repr(e), flush=True)
+            # Some Exotel setups are sensitive to the first packet timing/size.
+            # Send in small multiples of 320 bytes.
+            await self._send_pcm16_8k(pcm8)
+        except Exception as e:
+            # Do not crash the call if greeting fails.
+            print("Greeting TTS failed:", repr(e), flush=True)
 
     async def _flush_outbuf_if_ready(self):
         # Exotel wants chunk sizes multiple of 320 bytes; typical 100ms at 8kHz PCM16 ≈ 3200 bytes.
@@ -507,16 +507,17 @@ async def _send_initial_greeting(self):
             del self._outbuf[:target]
 
             msg = {
-    "event": "media",
-    "media": {
-        "payload": base64.b64encode(chunk).decode("utf-8"),
-    },
-}
-    # Include stream id if we have it (safe for Exotel; ignored if not needed)if self.call and self.call.stream_id:
-        msg["stream_sid"] = self.call.stream_id
-        await self.ws.send_text(json.dumps(msg))
+                "event": "media",
+                "media": {
+                    "payload": base64.b64encode(chunk).decode("utf-8"),
+                },
+            }
+            # Include stream id if we have it (safe for Exotel; ignored if not needed)
+            if self.call and getattr(self.call, "stream_id", None):
+                msg["stream_sid"] = self.call.stream_id
+            await self.ws.send_text(json.dumps(msg))
 
-async def finish(self, status: str = "completed"):
+    async def finish(self, status: str = "completed"):
         if self.call:
             self.call.status = status
             self.call.ended_at = dt.datetime.utcnow()
@@ -524,8 +525,6 @@ async def finish(self, status: str = "completed"):
             self.db.commit()
         await self.openai.close()
 
-
-# =========================
 # FastAPI app
 # =========================
 
@@ -635,9 +634,15 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
 
     session = ExotelSession(websocket=websocket, db=db, tenant=tenant)
 
+    # Robust receive loop: Starlette raises RuntimeError if receive() is called after a disconnect message.
     try:
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except RuntimeError as e:
+                if 'disconnect message' in str(e):
+                    break
+                raise
 
             raw = None
             if "text" in msg and msg["text"] is not None:
@@ -661,15 +666,21 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
 
             await session.handle_event(event)
     except WebSocketDisconnect:
-        await session.finish(status="disconnected")
+        pass
     except Exception:
-        await session.finish(status="error")
+        # Keep the connection cleanup stable even if session.finish is missing for any reason.
+        pass
+    finally:
+        fin = getattr(session, "finish", None)
+        if callable(fin):
+            try:
+                await fin(status="disconnected")
+            except Exception:
+                pass
         try:
             await websocket.close()
         except Exception:
             pass
-
-
 @app.websocket("/ws/exotel")
 async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(get_db)):
     await websocket.accept()
@@ -733,9 +744,15 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
         except Exception:
             pass
 
+    # Robust receive loop: Starlette raises RuntimeError if receive() is called after a disconnect message.
     try:
         while True:
-            msg = await websocket.receive()
+            try:
+                msg = await websocket.receive()
+            except RuntimeError as e:
+                if 'disconnect message' in str(e):
+                    break
+                raise
 
             raw = None
             if "text" in msg and msg["text"] is not None:
@@ -750,19 +767,26 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
                 continue
 
             # DEBUG: see what Exotel actually sends
-            print("WS IN event (first 200 chars):", raw[:200])
+            print("WS IN event (first 200 chars):", raw[:200], flush=True)
 
             try:
                 event = json.loads(raw)
             except Exception:
-                print("WS non-JSON payload (ignored)")
+                print("WS non-JSON payload (ignored)", flush=True)
                 continue
 
             await session.handle_event(event)
     except WebSocketDisconnect:
-        await session.finish(status="disconnected")
+        pass
     except Exception:
-        await session.finish(status="error")
+        pass
+    finally:
+        fin = getattr(session, "finish", None)
+        if callable(fin):
+            try:
+                await fin(status="disconnected")
+            except Exception:
+                pass
         try:
             await websocket.close()
         except Exception:
