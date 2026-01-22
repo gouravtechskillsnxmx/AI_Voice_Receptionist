@@ -18,6 +18,9 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase, Session, Mapped, mappe
 import websockets
 from websockets import WebSocketClientProtocol
 
+import urllib.request
+import urllib.error
+
 
 # =========================
 # Config
@@ -41,6 +44,11 @@ class Settings:
         "OPENAI_REALTIME_URL",
         "wss://api.openai.com/v1/realtime?model=" + os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
     )
+
+    OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "alloy")
+    OPENAI_TTS_GREETING: str = os.getenv("OPENAI_TTS_GREETING", "Hello. How can I help you today?")
+
 
 settings = Settings()
 
@@ -236,6 +244,48 @@ class OpenAIRealtimeClient:
 
 
 # =========================
+# OpenAI TTS helper (PCM16 24k)
+# =========================
+
+def openai_tts_pcm16_24k(text: str, voice: str | None = None, model: str | None = None) -> bytes:
+    """Return raw PCM16 little-endian mono @ 24kHz from OpenAI TTS.
+
+    Uses OpenAI Audio Speech endpoint with response_format='pcm'.
+    We keep this dependency-free (urllib) for Render.
+    """
+    if not settings.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    voice = voice or settings.OPENAI_TTS_VOICE
+    model = model or settings.OPENAI_TTS_MODEL
+
+    url = "https://api.openai.com/v1/audio/speech"
+    payload = {
+        "model": model,
+        "voice": voice,
+        "input": text,
+        "response_format": "pcm",
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"OpenAI TTS HTTPError {e.code}: {body[:300]}")
+
+
+
+# =========================
 # Audio helpers (8k <-> 24k) — Python 3.13 safe
 # =========================
 
@@ -312,6 +362,9 @@ class ExotelSession:
 
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
+
+        self._greeted = False
+        self._greet_task: Optional[asyncio.Task] = None
 
 
     async def _ensure_ai_started(self, reason: str):
@@ -414,6 +467,38 @@ class ExotelSession:
             async with self._out_lock:
                 self._outbuf.clear()
 
+
+
+async def _send_pcm16_8k(self, pcm16_8k: bytes):
+    """Queue outbound 8kHz PCM16 audio to Exotel stream."""
+    async with self._out_lock:
+        self._outbuf.extend(pcm16_8k)
+        await self._flush_outbuf_if_ready()
+
+async def _send_initial_greeting(self):
+    """Send an immediate greeting to Exotel to break the no-audio deadlock.
+
+    Exotel may not start sending inbound 'media' until it receives outbound audio.
+    We synthesize a short greeting using OpenAI TTS (PCM 24k) and downsample to 8k.
+    """
+    if self._greeted:
+        return
+    self._greeted = True
+
+    # Decide greeting text: prefer tenant prompt override later; for now use env.
+    greeting_text = (getattr(settings, "OPENAI_TTS_GREETING", "") or "").strip() or "Hello. How can I help you today?"
+
+    try:
+        pcm24 = openai_tts_pcm16_24k(greeting_text)
+        pcm8 = pcm16_24k_to_8k(pcm24)
+
+        # Some Exotel setups are sensitive to the first packet timing/size.
+        # Send in small multiples of 320 bytes.
+        await self._send_pcm16_8k(pcm8)
+    except Exception as e:
+        # Do not crash the call if greeting fails.
+        print("Greeting TTS failed:", repr(e), flush=True)
+
     async def _flush_outbuf_if_ready(self):
         # Exotel wants chunk sizes multiple of 320 bytes; typical 100ms at 8kHz PCM16 ≈ 3200 bytes.
         target = 320
@@ -422,12 +507,15 @@ class ExotelSession:
             del self._outbuf[:target]
 
             msg = {
-                "event": "media",
-                "media": {
-                    "payload": base64.b64encode(chunk).decode("utf-8"),
-                },
-            }
-            await self.ws.send_text(json.dumps(msg))
+    "event": "media",
+    "media": {
+        "payload": base64.b64encode(chunk).decode("utf-8"),
+    },
+}
+# Include stream id if we have it (safe for Exotel; ignored if not needed)
+if self.call and self.call.stream_id:
+    msg["stream_sid"] = self.call.stream_id
+await self.ws.send_text(json.dumps(msg))
 
     async def finish(self, status: str = "completed"):
         if self.call:
