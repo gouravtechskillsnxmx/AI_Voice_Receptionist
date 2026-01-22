@@ -246,6 +246,11 @@ class OpenAIRealtimeClient:
         }
         if instructions:
             payload["response"]["instructions"] = instructions
+        # Commit buffered audio so the model can respond (safe no-op if server already committed)
+        try:
+            await self.send_json({"type": "input_audio_buffer.commit"})
+        except Exception:
+            pass
         await self.send_json(payload)
 
     async def _recv_loop(self):
@@ -268,6 +273,11 @@ class OpenAIRealtimeClient:
                     t = event.get("transcript", "")
                     if t:
                         await self.on_transcript(t)
+
+                # Some streams may not emit VAD stop events reliably; if we got a final transcript,
+                # trigger a response (guarded by _response_in_progress).
+                if not self._user_speaking:
+                    await self.request_response()
 
 
             # VAD events (server_vad): trigger a response when the caller stops speaking.
@@ -365,6 +375,8 @@ class ExotelSession:
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
 
+        # Track current Exotel stream_sid so outbound audio includes it (required for Voicebot)
+        self.stream_sid: str = ""
 
 
     async def _send_exotel_media_pcm16_8k(self, stream_sid: str, pcm16_8k: bytes):
@@ -489,7 +501,8 @@ class ExotelSession:
         await self.openai.connect(system_prompt=prompt)
 
     async def handle_event(self, event: dict):
-        et = (event.get("event") or event.get("type") or "").lower()        # Start OpenAI session as early as possible WITHOUT blocking the Exotel WS receive loop.
+        et = (event.get("event") or event.get("type") or "").lower()
+        # Start OpenAI session as early as possible WITHOUT blocking the Exotel WS receive loop.
         # Exotel typically sends: connected -> start -> media. If we block here, Exotel may hang up quickly.
         if et == "connected" and not self._ai_started:
             await self._ensure_ai_started("connected")
@@ -501,6 +514,8 @@ class ExotelSession:
             meta = event.get("start") or event.get("data") or event.get("connected") or event
 
             stream_id = meta.get("stream_id") or meta.get("streamSid") or meta.get("stream_sid") or ""
+            # Store for outbound audio
+            self.stream_sid = str(stream_id) if stream_id else self.stream_sid
             call_id = meta.get("call_id") or meta.get("callSid") or meta.get("call_sid") or ""
             frm = meta.get("from") or meta.get("from_number") or meta.get("CallFrom") or ""
             to = meta.get("to") or meta.get("to_number") or meta.get("CallTo") or self.tenant.exotel_virtual_number
@@ -559,6 +574,7 @@ class ExotelSession:
 
             msg = {
                 "event": "media",
+                "stream_sid": (self.stream_sid or (self.call.stream_id if self.call else "")),
                 "media": {
                     "payload": base64.b64encode(chunk).decode("utf-8"),
                 },
