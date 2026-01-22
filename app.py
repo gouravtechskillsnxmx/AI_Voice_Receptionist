@@ -45,10 +45,10 @@ class Settings:
         "wss://api.openai.com/v1/realtime?model=" + os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
     )
 
+    # OpenAI TTS for initial greeting (Option B)
     OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
     OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "alloy")
-    OPENAI_TTS_GREETING: str = os.getenv("OPENAI_TTS_GREETING", "Hello. How can I help you today?")
-
+    OPENAI_TTS_GREETING: str = os.getenv("OPENAI_TTS_GREETING", "Hello! Thanks for calling. How can I help you today?")
 
 settings = Settings()
 
@@ -244,48 +244,6 @@ class OpenAIRealtimeClient:
 
 
 # =========================
-# OpenAI TTS helper (PCM16 24k)
-# =========================
-
-def openai_tts_pcm16_24k(text: str, voice: str | None = None, model: str | None = None) -> bytes:
-    """Return raw PCM16 little-endian mono @ 24kHz from OpenAI TTS.
-
-    Uses OpenAI Audio Speech endpoint with response_format='pcm'.
-    We keep this dependency-free (urllib) for Render.
-    """
-    if not settings.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-
-    voice = voice or settings.OPENAI_TTS_VOICE
-    model = model or settings.OPENAI_TTS_MODEL
-
-    url = "https://api.openai.com/v1/audio/speech"
-    payload = {
-        "model": model,
-        "voice": voice,
-        "input": text,
-        "response_format": "pcm",
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"OpenAI TTS HTTPError {e.code}: {body[:300]}")
-
-
-
-# =========================
 # Audio helpers (8k <-> 24k) — Python 3.13 safe
 # =========================
 
@@ -363,9 +321,86 @@ class ExotelSession:
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
 
-        self._greeted = False
-        self._greet_task: Optional[asyncio.Task] = None
 
+
+    async def _send_exotel_media_pcm16_8k(self, stream_sid: str, pcm16_8k: bytes):
+        """Send PCM16 8kHz mono audio to Exotel in 320-byte chunks."""
+        if not stream_sid or not pcm16_8k:
+            return
+        # Exotel expects payload chunks multiple of 320 bytes (20ms @ 8kHz PCM16 mono)
+        chunk = 320
+        for i in range(0, len(pcm16_8k), chunk):
+            part = pcm16_8k[i:i+chunk]
+            if len(part) < chunk:
+                part = part + b"\x00" * (chunk - len(part))
+            msg = {
+                "event": "media",
+                "stream_sid": stream_sid,
+                "media": {"payload": base64.b64encode(part).decode("ascii")},
+            }
+            try:
+                await self.ws.send_text(json.dumps(msg))
+            except Exception as e:
+                print("Failed to send media to Exotel:", repr(e), flush=True)
+                return
+
+    async def _send_exotel_silence(self, stream_sid: str, ms: int = 200):
+        """Send short silence immediately to prevent Exotel stream cancel while TTS is generated."""
+        # 8kHz * 2 bytes/sample => 16 bytes/ms
+        nbytes = max(320, int(ms * 16))
+        nbytes = (nbytes // 320) * 320
+        await self._send_exotel_media_pcm16_8k(stream_sid, b"\x00" * nbytes)
+
+    def _openai_tts_pcm16(self, text: str) -> bytes:
+        """Blocking call to OpenAI TTS. Returns raw PCM16 (typically 24kHz)."""
+        if not settings.OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is empty")
+        url = "https://api.openai.com/v1/audio/speech"
+        payload = {
+            "model": settings.OPENAI_TTS_MODEL,
+            "voice": settings.OPENAI_TTS_VOICE,
+            "input": text,
+            "response_format": "pcm",
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+            raise RuntimeError(f"TTS HTTPError {e.code}: {body[:300]}")
+        except Exception as e:
+            raise RuntimeError(f"TTS request failed: {repr(e)}")
+
+    async def _send_initial_greeting(self, stream_sid: str):
+        """Option B: send greeting audio immediately after Exotel 'start'."""
+        if not stream_sid:
+            return
+        try:
+            print("Sending initial silence...", flush=True)
+            await self._send_exotel_silence(stream_sid, ms=200)
+
+            greeting_text = (settings.OPENAI_TTS_GREETING or "").strip() or "Hello! How can I help you today?"
+            print("Generating TTS greeting...", flush=True)
+
+            # Run blocking HTTP in thread to avoid blocking the event loop
+            pcm_raw = await asyncio.to_thread(self._openai_tts_pcm16, greeting_text)
+
+            # Assume raw PCM16 is 24kHz, convert to 8kHz for Exotel
+            pcm8k = pcm16_24k_to_8k(pcm_raw)
+            print(f"Sending greeting audio bytes={len(pcm8k)}", flush=True)
+            await self._send_exotel_media_pcm16_8k(stream_sid, pcm8k)
+        except Exception as e:
+            print("Initial greeting failed:", repr(e), flush=True)
 
     async def _ensure_ai_started(self, reason: str):
         """Start OpenAI session in background without blocking Exotel WS receive loop."""
@@ -436,6 +471,10 @@ class ExotelSession:
             )
             self.db.add(self.call)
             self.db.commit()
+            # Option B: Exotel often won't send caller audio until it hears bot audio.
+            # Send an immediate greeting after we have stream id.
+            if et == "start" and stream_id:
+                asyncio.create_task(self._send_initial_greeting(str(stream_id)))
 
         elif et == "media":
             media = event.get("media") or event.get("data") or event
@@ -467,38 +506,6 @@ class ExotelSession:
             async with self._out_lock:
                 self._outbuf.clear()
 
-
-
-    async def _send_pcm16_8k(self, pcm16_8k: bytes):
-        """Queue outbound 8kHz PCM16 audio to Exotel stream."""
-        async with self._out_lock:
-            self._outbuf.extend(pcm16_8k)
-            await self._flush_outbuf_if_ready()
-
-    async def _send_initial_greeting(self):
-        """Send an immediate greeting to Exotel to break the no-audio deadlock.
-
-        Exotel may not start sending inbound 'media' until it receives outbound audio.
-        We synthesize a short greeting using OpenAI TTS (PCM 24k) and downsample to 8k.
-        """
-        if self._greeted:
-            return
-        self._greeted = True
-
-        # Decide greeting text: prefer tenant prompt override later; for now use env.
-        greeting_text = (getattr(settings, "OPENAI_TTS_GREETING", "") or "").strip() or "Hello. How can I help you today?"
-
-        try:
-            pcm24 = openai_tts_pcm16_24k(greeting_text)
-            pcm8 = pcm16_24k_to_8k(pcm24)
-
-            # Some Exotel setups are sensitive to the first packet timing/size.
-            # Send in small multiples of 320 bytes.
-            await self._send_pcm16_8k(pcm8)
-        except Exception as e:
-            # Do not crash the call if greeting fails.
-            print("Greeting TTS failed:", repr(e), flush=True)
-
     async def _flush_outbuf_if_ready(self):
         # Exotel wants chunk sizes multiple of 320 bytes; typical 100ms at 8kHz PCM16 ≈ 3200 bytes.
         target = 320
@@ -512,9 +519,6 @@ class ExotelSession:
                     "payload": base64.b64encode(chunk).decode("utf-8"),
                 },
             }
-            # Include stream id if we have it (safe for Exotel; ignored if not needed)
-            if self.call and getattr(self.call, "stream_id", None):
-                msg["stream_sid"] = self.call.stream_id
             await self.ws.send_text(json.dumps(msg))
 
     async def finish(self, status: str = "completed"):
@@ -525,6 +529,8 @@ class ExotelSession:
             self.db.commit()
         await self.openai.close()
 
+
+# =========================
 # FastAPI app
 # =========================
 
@@ -634,15 +640,9 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
 
     session = ExotelSession(websocket=websocket, db=db, tenant=tenant)
 
-    # Robust receive loop: Starlette raises RuntimeError if receive() is called after a disconnect message.
     try:
         while True:
-            try:
-                msg = await websocket.receive()
-            except RuntimeError as e:
-                if 'disconnect message' in str(e):
-                    break
-                raise
+            msg = await websocket.receive()
 
             raw = None
             if "text" in msg and msg["text"] is not None:
@@ -666,21 +666,15 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
 
             await session.handle_event(event)
     except WebSocketDisconnect:
-        pass
+        await session.finish(status="disconnected")
     except Exception:
-        # Keep the connection cleanup stable even if session.finish is missing for any reason.
-        pass
-    finally:
-        fin = getattr(session, "finish", None)
-        if callable(fin):
-            try:
-                await fin(status="disconnected")
-            except Exception:
-                pass
+        await session.finish(status="error")
         try:
             await websocket.close()
         except Exception:
             pass
+
+
 @app.websocket("/ws/exotel")
 async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(get_db)):
     await websocket.accept()
@@ -744,15 +738,9 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
         except Exception:
             pass
 
-    # Robust receive loop: Starlette raises RuntimeError if receive() is called after a disconnect message.
     try:
         while True:
-            try:
-                msg = await websocket.receive()
-            except RuntimeError as e:
-                if 'disconnect message' in str(e):
-                    break
-                raise
+            msg = await websocket.receive()
 
             raw = None
             if "text" in msg and msg["text"] is not None:
@@ -767,26 +755,19 @@ async def exotel_ws(websocket: WebSocket, to: str = "", db: Session = Depends(ge
                 continue
 
             # DEBUG: see what Exotel actually sends
-            print("WS IN event (first 200 chars):", raw[:200], flush=True)
+            print("WS IN event (first 200 chars):", raw[:200])
 
             try:
                 event = json.loads(raw)
             except Exception:
-                print("WS non-JSON payload (ignored)", flush=True)
+                print("WS non-JSON payload (ignored)")
                 continue
 
             await session.handle_event(event)
     except WebSocketDisconnect:
-        pass
+        await session.finish(status="disconnected")
     except Exception:
-        pass
-    finally:
-        fin = getattr(session, "finish", None)
-        if callable(fin):
-            try:
-                await fin(status="disconnected")
-            except Exception:
-                pass
+        await session.finish(status="error")
         try:
             await websocket.close()
         except Exception:
