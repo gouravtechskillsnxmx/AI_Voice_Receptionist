@@ -512,12 +512,11 @@ async def _send_initial_greeting(self):
         "payload": base64.b64encode(chunk).decode("utf-8"),
     },
 }
-# Include stream id if we have it (safe for Exotel; ignored if not needed)
-if self.call and self.call.stream_id:
-    msg["stream_sid"] = self.call.stream_id
-await self.ws.send_text(json.dumps(msg))
+    # Include stream id if we have it (safe for Exotel; ignored if not needed)if self.call and self.call.stream_id:
+        msg["stream_sid"] = self.call.stream_id
+        await self.ws.send_text(json.dumps(msg))
 
-    async def finish(self, status: str = "completed"):
+async def finish(self, status: str = "completed"):
         if self.call:
             self.call.status = status
             self.call.ended_at = dt.datetime.utcnow()
