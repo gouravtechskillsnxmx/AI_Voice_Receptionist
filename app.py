@@ -167,6 +167,12 @@ class OpenAIRealtimeClient:
         self.on_audio_delta = None  # async fn(bytes_pcm16_24k)
         self.on_transcript = None   # async fn(str)
 
+        # Auto-response control (so the bot answers after the caller finishes speaking)
+        self._response_in_progress = False
+        self._last_response_create_ts = 0.0
+        self._min_response_interval_s = 0.4
+        self._user_speaking = False
+
     async def connect(self, system_prompt: str, voice: str = "alloy"):
         if not settings.OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY is not set")
@@ -221,6 +227,27 @@ class OpenAIRealtimeClient:
         assert self.ws is not None
         await self.ws.send(json.dumps(obj))
 
+    async def request_response(self, instructions: str | None = None):
+        """Trigger a model response (audio+text) after user finishes speaking."""
+        if not self.ws:
+            return
+        if self._response_in_progress:
+            return
+        now = time.time()
+        if (now - self._last_response_create_ts) < self._min_response_interval_s:
+            return
+        self._last_response_create_ts = now
+        self._response_in_progress = True
+        payload = {
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio", "text"],
+            }
+        }
+        if instructions:
+            payload["response"]["instructions"] = instructions
+        await self.send_json(payload)
+
     async def _recv_loop(self):
         assert self.ws is not None
         async for msg in self.ws:
@@ -241,6 +268,23 @@ class OpenAIRealtimeClient:
                     t = event.get("transcript", "")
                     if t:
                         await self.on_transcript(t)
+
+
+            # VAD events (server_vad): trigger a response when the caller stops speaking.
+            elif et == "input_audio_buffer.speech_started":
+                self._user_speaking = True
+
+            elif et in ("input_audio_buffer.speech_stopped", "input_audio_buffer.timeout_triggered"):
+                # In server_vad mode, the server commits audio automatically; we still must ask for a response.
+                self._user_speaking = False
+                await self.request_response()
+
+            # Track response lifecycle to avoid spamming response.create
+            elif et == "response.created":
+                self._response_in_progress = True
+
+            elif et in ("response.done", "response.cancelled", "response.failed"):
+                self._response_in_progress = False
 
 
 # =========================
