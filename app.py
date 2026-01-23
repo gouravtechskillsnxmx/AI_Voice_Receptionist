@@ -246,7 +246,8 @@ class OpenAIRealtimeClient:
         }
         if instructions:
             payload["response"]["instructions"] = instructions
-        # Commit buffered audio so the model can respond (safe no-op if server already committed)
+        # Important: commit the current input audio buffer before asking for a response.
+        # Without this, the model may only produce the greeting and never answer the caller.
         try:
             await self.send_json({"type": "input_audio_buffer.commit"})
         except Exception:
@@ -273,11 +274,6 @@ class OpenAIRealtimeClient:
                     t = event.get("transcript", "")
                     if t:
                         await self.on_transcript(t)
-
-                # Some streams may not emit VAD stop events reliably; if we got a final transcript,
-                # trigger a response (guarded by _response_in_progress).
-                if not self._user_speaking:
-                    await self.request_response()
 
 
             # VAD events (server_vad): trigger a response when the caller stops speaking.
@@ -372,11 +368,11 @@ class ExotelSession:
         self._ai_ready = asyncio.Event()
         self._pre_audio = bytearray()  # buffer caller audio until AI is ready
 
+        self.stream_sid: str = ""  # current Exotel stream sid for outbound audio
+
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
 
-        # Track current Exotel stream_sid so outbound audio includes it (required for Voicebot)
-        self.stream_sid: str = ""
 
 
     async def _send_exotel_media_pcm16_8k(self, stream_sid: str, pcm16_8k: bytes):
@@ -394,8 +390,10 @@ class ExotelSession:
                 "stream_sid": stream_sid,
                 "media": {"payload": base64.b64encode(part).decode("ascii")},
             }
+            out_raw = json.dumps(msg)
+            print("WS OUT event (first 200 chars):", out_raw[:200], flush=True)
             try:
-                await self.ws.send_text(json.dumps(msg))
+                await self.ws.send_text(out_raw)
             except Exception as e:
                 print("Failed to send media to Exotel:", repr(e), flush=True)
                 return
@@ -509,13 +507,42 @@ class ExotelSession:
         elif et == "start" and not self._ai_started:
             await self._ensure_ai_started("start")
 
+        # Failsafe: some Exotel/Voicebot streams may send "media" before "connected"/"start".
+        # If that happens, bootstrap stream_sid + call record and start AI on first media so we can respond.
+        if et == "media" and (not self._ai_started or not self.call):
+            sid = (
+                (event.get("stream_sid") or event.get("streamSid") or event.get("stream_id") or event.get("streamId") or "")
+            )
+            if not sid:
+                m = event.get("media") or {}
+                sid = (m.get("stream_sid") or m.get("streamSid") or m.get("stream_id") or m.get("streamId") or "")
+            sid = str(sid).strip()
+            if sid and not self.stream_sid:
+                self.stream_sid = sid
+            if not self.call and sid:
+                # Create a minimal call row so transcripts/status can be stored
+                self.call = Call(
+                    tenant_id=self.tenant.id,
+                    stream_id=sid,
+                    call_id="",
+                    from_number="",
+                    to_number=self.tenant.exotel_virtual_number,
+                    status="in_progress",
+                )
+                try:
+                    self.db.add(self.call)
+                    self.db.commit()
+                except Exception:
+                    self.db.rollback()
+            if not self._ai_started:
+                await self._ensure_ai_started("media")
 
         if et in ("start", "connected"):
             meta = event.get("start") or event.get("data") or event.get("connected") or event
 
             stream_id = meta.get("stream_id") or meta.get("streamSid") or meta.get("stream_sid") or ""
-            # Store for outbound audio
-            self.stream_sid = str(stream_id) if stream_id else self.stream_sid
+            if stream_id and not self.stream_sid:
+                self.stream_sid = str(stream_id)
             call_id = meta.get("call_id") or meta.get("callSid") or meta.get("call_sid") or ""
             frm = meta.get("from") or meta.get("from_number") or meta.get("CallFrom") or ""
             to = meta.get("to") or meta.get("to_number") or meta.get("CallTo") or self.tenant.exotel_virtual_number
@@ -536,6 +563,10 @@ class ExotelSession:
                 asyncio.create_task(self._send_initial_greeting(str(stream_id)))
 
         elif et == "media":
+            if not self.stream_sid:
+                sid = (event.get("stream_sid") or event.get("streamSid") or event.get("stream_id") or event.get("streamId") or "")
+                if sid:
+                    self.stream_sid = str(sid)
             media = event.get("media") or event.get("data") or event
             payload = media.get("payload") or media.get("audio") or media.get("chunk") or ""
             if not payload:
@@ -567,6 +598,9 @@ class ExotelSession:
 
     async def _flush_outbuf_if_ready(self):
         # Exotel wants chunk sizes multiple of 320 bytes; typical 100ms at 8kHz PCM16 ≈ 3200 bytes.
+        # Keep 320-byte chunks for compatibility, but ALWAYS include stream_sid for Voicebot playback.
+        if not self.stream_sid:
+            return
         target = 320
         while len(self._outbuf) >= target:
             chunk = bytes(self._outbuf[:target])
@@ -574,12 +608,14 @@ class ExotelSession:
 
             msg = {
                 "event": "media",
-                "stream_sid": (self.stream_sid or (self.call.stream_id if self.call else "")),
+                "stream_sid": self.stream_sid,
                 "media": {
                     "payload": base64.b64encode(chunk).decode("utf-8"),
                 },
             }
-            await self.ws.send_text(json.dumps(msg))
+            out_raw = json.dumps(msg)
+            print("WS OUT event (first 200 chars):", out_raw[:200], flush=True)
+            await self.ws.send_text(out_raw)
 
     async def finish(self, status: str = "completed"):
         if self.call:
