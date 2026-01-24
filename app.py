@@ -343,6 +343,10 @@ class ExotelSession:
         self._outbuf = bytearray()
         self._out_lock = asyncio.Lock()
 
+        # Exotel stream identifier (required on every outbound media frame)
+        self.stream_sid: str = ""
+        self._greeting_sent: bool = False
+
 
 
     async def _send_exotel_media_pcm16_8k(self, stream_sid: str, pcm16_8k: bytes):
@@ -361,7 +365,9 @@ class ExotelSession:
                 "media": {"payload": base64.b64encode(part).decode("ascii")},
             }
             try:
-                await self.ws.send_text(json.dumps(msg))
+                raw = json.dumps(msg)
+                print("WS OUT event (first 200 chars):", raw[:200], flush=True)
+                await self.ws.send_text(raw)
             except Exception as e:
                 print("Failed to send media to Exotel:", repr(e), flush=True)
                 return
@@ -467,18 +473,37 @@ class ExotelSession:
         await self.openai.connect(system_prompt=prompt)
 
     async def handle_event(self, event: dict):
-        et = (event.get("event") or event.get("type") or "").lower()        # Start OpenAI session as early as possible WITHOUT blocking the Exotel WS receive loop.
+        et = (event.get("event") or event.get("type") or "").lower()
+        # Start OpenAI session as early as possible WITHOUT blocking the Exotel WS receive loop.
         # Exotel typically sends: connected -> start -> media. If we block here, Exotel may hang up quickly.
         if et == "connected" and not self._ai_started:
             await self._ensure_ai_started("connected")
         elif et == "start" and not self._ai_started:
             await self._ensure_ai_started("start")
 
+        # Start-on-media failsafe: some Exotel Voicebot applets send 'media' before 'start/connected'.
+        # If we see media first, capture stream_sid and start the AI session immediately.
+        if et == "media":
+            media_obj = event.get("media") or event.get("data") or {}
+            sid = event.get("stream_sid") or media_obj.get("stream_sid") or media_obj.get("streamSid") or ""
+            if sid and not self.stream_sid:
+                self.stream_sid = str(sid)
+            if not self._ai_started:
+                await self._ensure_ai_started("media")
+            # If Exotel hasn't heard anything yet, send a greeting once we know stream_sid
+            if self.stream_sid and not self._greeting_sent:
+                self._greeting_sent = True
+                asyncio.create_task(self._send_initial_greeting(self.stream_sid))
+
+
 
         if et in ("start", "connected"):
             meta = event.get("start") or event.get("data") or event.get("connected") or event
 
             stream_id = meta.get("stream_id") or meta.get("streamSid") or meta.get("stream_sid") or ""
+
+            if stream_id and not self.stream_sid:
+                self.stream_sid = str(stream_id)
             call_id = meta.get("call_id") or meta.get("callSid") or meta.get("call_sid") or ""
             frm = meta.get("from") or meta.get("from_number") or meta.get("CallFrom") or ""
             to = meta.get("to") or meta.get("to_number") or meta.get("CallTo") or self.tenant.exotel_virtual_number
@@ -496,13 +521,27 @@ class ExotelSession:
             # Option B: Exotel often won't send caller audio until it hears bot audio.
             # Send an immediate greeting after we have stream id.
             if et == "start" and stream_id:
-                asyncio.create_task(self._send_initial_greeting(str(stream_id)))
+                self._greeting_sent = True
+                asyncio.create_task(self._send_initial_greeting(self.stream_sid or str(stream_id)))
 
         elif et == "media":
             media = event.get("media") or event.get("data") or event
             payload = media.get("payload") or media.get("audio") or media.get("chunk") or ""
             if not payload:
                 return
+            # Capture stream_sid from media (needed on outbound frames)
+            sid = event.get("stream_sid") or (media.get("stream_sid") if isinstance(media, dict) else "") or (media.get("streamSid") if isinstance(media, dict) else "")
+            if sid and not self.stream_sid:
+                self.stream_sid = str(sid)
+
+            # If Exotel sends media before start/connected, ensure AI starts.
+            if not self._ai_started:
+                await self._ensure_ai_started("media")
+
+            # If Exotel hasn't heard anything yet, send greeting once we know stream_sid
+            if self.stream_sid and not self._greeting_sent:
+                self._greeting_sent = True
+                asyncio.create_task(self._send_initial_greeting(self.stream_sid))
 
             pcm16_8k = base64.b64decode(payload)
             pcm16_24k = pcm16_8k_to_24k(pcm16_8k)
@@ -529,19 +568,25 @@ class ExotelSession:
                 self._outbuf.clear()
 
     async def _flush_outbuf_if_ready(self):
-        # Exotel wants chunk sizes multiple of 320 bytes; typical 100ms at 8kHz PCM16 ≈ 3200 bytes.
-        target = 320
+        # Exotel wants chunk sizes multiple of 320 bytes; 100ms at 8kHz PCM16 ≈ 3200 bytes.
+        target = 3200
+        stream_sid = self.stream_sid or (self.call.stream_id if self.call else "")
+        if not stream_sid:
+            # We can't send audio frames without a stream_sid; wait until we receive start/media.
+            return
+
         while len(self._outbuf) >= target:
             chunk = bytes(self._outbuf[:target])
             del self._outbuf[:target]
 
             msg = {
                 "event": "media",
-                "media": {
-                    "payload": base64.b64encode(chunk).decode("utf-8"),
-                },
+                "stream_sid": stream_sid,
+                "media": {"payload": base64.b64encode(chunk).decode("utf-8")},
             }
-            await self.ws.send_text(json.dumps(msg))
+            raw = json.dumps(msg)
+            print("WS OUT event (first 200 chars):", raw[:200], flush=True)
+            await self.ws.send_text(raw)
 
     async def finish(self, status: str = "completed"):
         if self.call:
