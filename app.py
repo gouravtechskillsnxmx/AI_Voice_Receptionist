@@ -617,12 +617,16 @@ async def exotel_media_ws(ws: WebSocket):
                                 out_b64 = base64.b64encode(pcm8).decode("ascii")
 
                                 # --- send to Exotel ---
+                                if not stream_sid:
+                                    logger.info("Skip WS OUT media (stream_sid not set yet)")
+                                    continue
                                 speaking = True
                                 await ws.send_text(json.dumps({
                                     "event": "media",
                                     "stream_sid": stream_sid,
                                     "media": {"payload": out_b64}
                                 }))
+                                logger.info("WS OUT media stream_sid=%s bytes=%d", stream_sid, len(pcm8))
 
                         elif etype == "response.completed":
                             speaking = False
@@ -1037,7 +1041,10 @@ if False:
             self.ws = websocket
             self.db = db
             self.tenant = tenant
-    
+
+
+            # Exotel requires stream_sid on outbound media; set when we receive start/connected.
+            self.stream_sid: str = ""    
             self.call: Optional[Call] = None
             self.openai = OpenAIRealtimeClient()
     
@@ -1074,6 +1081,7 @@ if False:
                 meta = event.get("start") or event.get("data") or event.get("connected") or event
     
                 stream_id = meta.get("stream_id") or meta.get("streamSid") or meta.get("stream_sid") or ""
+                self.stream_sid = str(stream_id)  # required for outbound media
                 call_id = meta.get("call_id") or meta.get("callSid") or meta.get("call_sid") or ""
                 frm = meta.get("from") or meta.get("from_number") or meta.get("CallFrom") or ""
                 to = meta.get("to") or meta.get("to_number") or meta.get("CallTo") or self.tenant.exotel_virtual_number
@@ -1119,6 +1127,12 @@ if False:
                         "payload": base64.b64encode(chunk).decode("utf-8"),
                     },
                 }
+                if self.stream_sid:
+                    msg["stream_sid"] = self.stream_sid
+                try:
+                    logger.info("WS OUT media stream_sid=%s bytes=%d", self.stream_sid or "?", len(chunk))
+                except Exception:
+                    pass
                 await self.ws.send_text(json.dumps(msg))
     
         async def finish(self, status: str = "completed"):
