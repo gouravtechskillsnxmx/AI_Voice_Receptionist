@@ -45,6 +45,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import OperationalError
 import datetime as _dt
 
+app = FastAPI()
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip() or "sqlite:///./dev.db"
 _engine = create_engine(
     DATABASE_URL,
@@ -104,7 +106,7 @@ async def admin_list_tenants(x_admin_key: str | None = Header(default=None), db=
     ]
 # =================== end SaaS: Tenants ===================
 r = logging.getLogger("ws_server")
-app = FastAPI()
+
 # ---------- Env ----------
 try:
     from dotenv import load_dotenv  # optional for local dev
