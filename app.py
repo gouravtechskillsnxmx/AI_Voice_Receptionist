@@ -38,7 +38,7 @@ from scipy.signal import resample
 # ---------- Logging ----------
 level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, level, logging.INFO))
-logge
+
 # ===================== SaaS: Tenants (SQLite) =====================
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
