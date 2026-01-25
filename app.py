@@ -138,16 +138,39 @@ logger = logging.getLogger("ws_server")
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
 #----------------------------------------------------
-import audioop
+try:
+    import audioop as _audioop  # Python <3.13
+except Exception:  # Python 3.13+: audioop removed
+    _audioop = None
+
 import wave
 import time
 
 SAVE_TTS_WAV = os.getenv("SAVE_TTS_WAV", "0") == "1"
 
+# ---- audio resampling helper (audioop removed in Python 3.13) ----
+def _audio_ratecv(pcm: bytes, inrate: int, outrate: int) -> bytes:
+    """Resample mono PCM16 using audioop.ratecv if available, else scipy/numpy."""
+    if not pcm:
+        return b""
+    if _audioop is not None:
+        converted, _ = _audioop.ratecv(pcm, 2, 1, inrate, outrate, None)
+        return converted
+    # Fallback: scipy/numpy resample
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    try:
+        from scipy.signal import resample_poly
+        y = resample_poly(x, outrate, inrate)
+    except Exception:
+        n = int(round(len(x) * float(outrate) / float(inrate)))
+        y = resample(x, n)
+    y = np.clip(np.round(y), -32768, 32767).astype(np.int16)
+    return y.tobytes()
+
+
 def downsample_24k_to_8k_pcm16(pcm24: bytes) -> bytes:
     """24 kHz mono PCM16 → 8 kHz mono PCM16."""
-    converted, _ = audioop.ratecv(pcm24, 2, 1, 24000, 8000, None)
-    return converted
+    return _audio_ratecv(pcm24, 24000, 8000)
 
 #------------------------------------------
 
@@ -999,12 +1022,10 @@ if False:
     # =========================
     
     def pcm16_8k_to_24k(pcm16_8k: bytes) -> bytes:
-        converted, _ = audioop.ratecv(pcm16_8k, 2, 1, 8000, 24000, None)
-        return converted
+        return _audio_ratecv(pcm16_8k, 8000, 24000)
     
     def pcm16_24k_to_8k(pcm16_24k: bytes) -> bytes:
-        converted, _ = audioop.ratecv(pcm16_24k, 2, 1, 24000, 8000, None)
-        return converted
+        return _audio_ratecv(pcm16_24k, 24000, 8000)
     
     
     # =========================
