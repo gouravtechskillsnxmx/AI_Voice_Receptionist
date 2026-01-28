@@ -3,11 +3,65 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 import aiohttp
 
+# --- Local SaaS storage (SQLite today, Postgres later) ---
+
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base
+import datetime as _dt
+
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("voicebridge")
 
 app = FastAPI()
+
+
+# -------------------- Local DB (Tenants + Call Events) --------------------
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip() or "sqlite:///./voicebridge.db"
+_engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    pool_pre_ping=True,
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+Base = declarative_base()
+
+class LocalTenant(Base):
+    __tablename__ = "tenants"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False, default="Tenant")
+    # "to_number" a.k.a Exotel virtual number mapped to this tenant
+    to_number = Column(String(50), unique=True, index=True, nullable=False)
+    system_prompt = Column(Text, nullable=False, default="You are a helpful receptionist. Keep replies short.")
+    transfer_number = Column(String(50), nullable=True)
+    missed_call_sms_to = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=_dt.datetime.utcnow)
+
+class CallEvent(Base):
+    __tablename__ = "call_events"
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, index=True, nullable=True)
+    provider = Column(String(32), default="exotel")
+    call_sid = Column(String(128), index=True, nullable=False)
+    stream_sid = Column(String(128), index=True, nullable=True)
+    event_type = Column(String(64), index=True, nullable=False)
+    payload_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=_dt.datetime.utcnow)
+
+def _db_init():
+    Base.metadata.create_all(bind=_engine)
+
+_db_init()
+
+def _db():
+    db = SessionLocal()
+    try:
+        return db
+    except Exception:
+        db.close()
+        raise
+
 
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip()
 SAAS_BASE_URL = (os.getenv("SAAS_BASE_URL") or "").strip().rstrip("/")
@@ -20,9 +74,23 @@ def _host_only(v: str) -> str:
     return v.replace("https://","").replace("http://","").strip().strip("/")
 
 async def _saas_get_tenant(to_number: str) -> Dict[str, Any]:
+    # If SAAS_BASE_URL is not provided, we use the local SQLite tenant table (single-service mode).
     if not SAAS_BASE_URL:
-        return {"tenant_id": None, "system_prompt": "You are a helpful receptionist. Keep replies short.",
-                "transfer_number": None, "missed_call_sms_to": None}
+        db = _db()
+        try:
+            t = db.query(LocalTenant).filter(LocalTenant.to_number == (to_number or "").strip()).first()
+            if not t:
+                return {"tenant_id": None, "system_prompt": "You are a helpful receptionist. Keep replies short.",
+                        "transfer_number": None, "missed_call_sms_to": None}
+            return {"tenant_id": t.id, "system_prompt": t.system_prompt,
+                    "transfer_number": t.transfer_number, "missed_call_sms_to": t.missed_call_sms_to}
+        except Exception as e:
+            log.warning("Local tenant lookup error: %r", e)
+            return {"tenant_id": None, "system_prompt": "You are a helpful receptionist. Keep replies short.",
+                    "transfer_number": None, "missed_call_sms_to": None}
+        finally:
+            try: db.close()
+            except Exception: pass
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
             async with s.get(
@@ -42,7 +110,25 @@ async def _saas_get_tenant(to_number: str) -> Dict[str, Any]:
                 "transfer_number": None, "missed_call_sms_to": None}
 
 async def _saas_post_event(event: Dict[str, Any]) -> None:
+    # Single-service mode: store events locally when SAAS_BASE_URL is not set.
     if not SAAS_BASE_URL:
+        db = _db()
+        try:
+            tenant_id = event.get("tenant_id")
+            db.add(CallEvent(
+                tenant_id=int(tenant_id) if tenant_id is not None else None,
+                provider=(event.get("provider") or "exotel"),
+                call_sid=(event.get("call_sid") or "unknown"),
+                stream_sid=(event.get("stream_sid") or None),
+                event_type=(event.get("type") or "event"),
+                payload_json=json.dumps(event.get("payload") or {})[:50000],
+            ))
+            db.commit()
+        except Exception as e:
+            log.warning("Local event store failed: %r", e)
+        finally:
+            try: db.close()
+            except Exception: pass
         return
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
@@ -60,6 +146,139 @@ async def _saas_post_event(event: Dict[str, Any]) -> None:
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+
+# -------------------- Admin API (create/list tenants) --------------------
+ADMIN_API_KEY = (os.getenv("ADMIN_API_KEY") or os.getenv("Admin_API_Key") or "").strip()
+
+def _require_admin(x_admin_key: str | None):
+    if not ADMIN_API_KEY or not x_admin_key or x_admin_key.strip() != ADMIN_API_KEY:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.post("/admin/tenants")
+async def admin_create_tenant(payload: dict, request: Request):
+    x_admin_key = request.headers.get("X-Admin-Key") or request.headers.get("x-admin-key")
+    _require_admin(x_admin_key)
+    name = (payload.get("name") or "").strip() or "Tenant"
+    to_number = (payload.get("to_number") or payload.get("exotel_virtual_number") or "").strip()
+    system_prompt = (payload.get("system_prompt") or "").strip() or "You are a helpful receptionist. Keep replies short."
+    transfer_number = (payload.get("transfer_number") or payload.get("forward_to_number") or "").strip() or None
+    missed_call_sms_to = (payload.get("missed_call_sms_to") or "").strip() or None
+    if not to_number:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="to_number (or exotel_virtual_number) required")
+
+    db = _db()
+    try:
+        # upsert by to_number
+        t = db.query(LocalTenant).filter(LocalTenant.to_number == to_number).first()
+        if t is None:
+            t = LocalTenant(
+                name=name,
+                to_number=to_number,
+                system_prompt=system_prompt,
+                transfer_number=transfer_number,
+                missed_call_sms_to=missed_call_sms_to,
+            )
+            db.add(t)
+            db.commit()
+            db.refresh(t)
+        else:
+            t.name = name
+            t.system_prompt = system_prompt
+            t.transfer_number = transfer_number
+            t.missed_call_sms_to = missed_call_sms_to
+            db.add(t)
+            db.commit()
+            db.refresh(t)
+        return {
+            "tenant_id": t.id,
+            "name": t.name,
+            "to_number": t.to_number,
+            "system_prompt": t.system_prompt,
+            "transfer_number": t.transfer_number,
+            "missed_call_sms_to": t.missed_call_sms_to,
+        }
+    finally:
+        db.close()
+
+@app.get("/admin/tenants")
+async def admin_list_tenants(request: Request):
+    x_admin_key = request.headers.get("X-Admin-Key") or request.headers.get("x-admin-key")
+    _require_admin(x_admin_key)
+    db = _db()
+    try:
+        rows = db.query(LocalTenant).order_by(LocalTenant.id.desc()).all()
+        return [
+            {
+                "tenant_id": r.id,
+                "name": r.name,
+                "to_number": r.to_number,
+                "system_prompt": r.system_prompt,
+                "transfer_number": r.transfer_number,
+                "missed_call_sms_to": r.missed_call_sms_to,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
+
+# -------------------- Internal endpoints for adapter mode --------------------
+@app.get("/internal/tenant-by-number")
+async def internal_tenant_by_number(to: str = "", request: Request = None):
+    # Optional shared secret
+    if VOICE_WEBHOOK_SECRET:
+        got = (request.headers.get("X-Voice-Secret") if request else "") or ""
+        if got.strip() != VOICE_WEBHOOK_SECRET.strip():
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    to_number = (to or "").strip()
+    db = _db()
+    try:
+        t = db.query(LocalTenant).filter(LocalTenant.to_number == to_number).first()
+        if not t:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Tenant not found")
+        return {
+            "tenant_id": t.id,
+            "system_prompt": t.system_prompt,
+            "transfer_number": t.transfer_number,
+            "missed_call_sms_to": t.missed_call_sms_to,
+        }
+    finally:
+        db.close()
+
+@app.post("/webhooks/voicebridge")
+async def webhook_voicebridge(event: dict, request: Request):
+    if VOICE_WEBHOOK_SECRET:
+        got = (request.headers.get("X-Voice-Secret") or "").strip()
+        if got != VOICE_WEBHOOK_SECRET.strip():
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    db = _db()
+    try:
+        tenant_id = event.get("tenant_id")
+        call_sid = (event.get("call_sid") or "").strip() or "unknown"
+        stream_sid = (event.get("stream_sid") or "").strip() or None
+        etype = (event.get("type") or "event").strip()
+        payload = event.get("payload") or {}
+        db.add(CallEvent(
+            tenant_id=int(tenant_id) if tenant_id is not None else None,
+            provider=(event.get("provider") or "exotel"),
+            call_sid=call_sid,
+            stream_sid=stream_sid,
+            event_type=etype,
+            payload_json=json.dumps(payload)[:50000],
+        ))
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
 
 @app.get("/exotel/ws-bootstrap")
 async def exotel_ws_bootstrap(request: Request):
