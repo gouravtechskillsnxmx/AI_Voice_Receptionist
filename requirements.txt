@@ -1,4 +1,14 @@
 fastapi==0.115.6
 uvicorn[standard]==0.30.6
 gunicorn==22.0.0
+
+SQLAlchemy==2.0.36
 aiohttp==3.13.3
+
+python-dotenv==1.2.1
+python-multipart==0.0.22
+
+numpy==2.4.1
+scipy==1.17.0
+
+requests==2.32.5
