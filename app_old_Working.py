@@ -1264,4 +1264,5 @@ if False:
                 await websocket.close()
             except Exception:
                 pass
+
 # ================= END LEGACY =================
