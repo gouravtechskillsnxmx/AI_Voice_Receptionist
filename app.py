@@ -129,6 +129,18 @@ class BridgeSession:
             }
         })
 
+        # Proactively speak first so the call doesn't feel "dead" and Exotel doesn't time out.
+        try:
+            await self._ai_ws.send_json({
+                "type": "response.create",
+                "response": {
+                    "instructions": "Greet the caller in one short sentence and ask how you can help. Keep it brief.",
+                    "modalities": ["audio", "text"]
+                }
+            })
+        except Exception as e:
+            log.warning("Failed to trigger initial greeting: %r", e)
+
         asyncio.create_task(self._pump_openai_to_exotel())
         log.info("AI session started tenant_id=%s to=%s", self.tenant_id, self.to_number)
 
@@ -198,18 +210,31 @@ class BridgeSession:
 
     async def handle_exotel(self, evt: Dict[str, Any]) -> Optional[str]:
         et = evt.get("event")
+        try:
+            log.info("WS IN event=%s first200=%s", et, json.dumps(evt)[:200])
+        except Exception:
+            pass
         if et == "connected":
-            if not self._ai_started:
+            # Exotel usually sends connected -> start. Start contains to/call_sid/stream_sid.
+            # If we don't yet know the destination number, wait for start or media.
+            if self.to_number and (not self._ai_started):
                 await self.start_ai()
         elif et == "start":
             s = evt.get("start") or {}
             self.stream_sid = evt.get("stream_sid") or s.get("stream_sid") or self.stream_sid
+            # Capture call/to from start if query params were not passed
+            if not self.call_sid or self.call_sid == "unknown":
+                self.call_sid = s.get("call_sid") or evt.get("call_sid") or self.call_sid
+            if not self.to_number:
+                self.to_number = s.get("to") or s.get("CallTo") or s.get("call_to") or self.to_number
             if not self._ai_started:
                 await self.start_ai()
         elif et == "media":
             self.stream_sid = evt.get("stream_sid") or self.stream_sid
             media = evt.get("media") or {}
             payload = media.get("payload") or ""
+            if (not self._ai_started):
+                await self.start_ai()
             if payload and self._ai_ws:
                 await self._ai_ws.send_json({"type":"input_audio_buffer.append","audio": payload})
         elif et == "stop":
@@ -221,7 +246,7 @@ async def exotel_media(ws: WebSocket):
     await ws.accept()
     to_number = (ws.query_params.get("to") or "").strip()
     call_sid = (ws.query_params.get("call_sid") or "unknown").strip()
-    log.info("Exotel WS connected to=%s call_sid=%s", to_number, call_sid)
+    log.info("Exotel WS connected to=%s call_sid=%s qs=%s", to_number, call_sid, dict(ws.query_params))
 
     sess = BridgeSession(ws, to_number, call_sid)
     try:
