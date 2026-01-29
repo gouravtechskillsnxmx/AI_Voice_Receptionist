@@ -944,62 +944,45 @@ if False:
             self._recv_task: asyncio.Task | None = None
             self.on_audio_delta = None  # async fn(bytes_pcm16_24k)
             self.on_transcript = None   # async fn(str)
-    
         async def connect(self, system_prompt: str, voice: str = "alloy"):
             if not settings.OPENAI_API_KEY:
                 raise RuntimeError("OPENAI_API_KEY is not set")
-    
+
             headers = [
                 ("Authorization", f"Bearer {settings.OPENAI_API_KEY}"),
                 OPENAI_BETA_HEADER,
             ]
+
             # websockets kw name changed across versions; support both.
-        try:
-            self.ws = await websockets.connect(
-                settings.OPENAI_REALTIME_URL,
-                additional_headers=headers,
-                ping_interval=20,
-            )
-        except TypeError:
-            self.ws = await websockets.connect(
-                settings.OPENAI_REALTIME_URL,
-                extra_headers=headers,
-                ping_interval=20,
-            )# Configure session
+            try:
+                self.ws = await websockets.connect(
+                    settings.OPENAI_REALTIME_URL,
+                    additional_headers=headers,
+                    ping_interval=20,
+                )
+            except TypeError:
+                self.ws = await websockets.connect(
+                    settings.OPENAI_REALTIME_URL,
+                    extra_headers=headers,
+                    ping_interval=20,
+                )
+
+            # Configure session
             await self.send_json({
                 "type": "session.update",
                 "session": {
                     "instructions": system_prompt,
                     "voice": voice,
                     "turn_detection": {"type": "server_vad"},
-                    "input_audio_format": {"type": "pcm16", "sample_rate": 24000, "channels": 1},
-                    "output_audio_format": {"type": "pcm16", "sample_rate": 24000, "channels": 1},
+                    # IMPORTANT: these must be strings, not objects
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
                     "input_audio_transcription": {"model": "gpt-4o-transcribe"},
                 }
             })
-    
+
             self._recv_task = asyncio.create_task(self._recv_loop())
-    
-            # Ask model to greet first
-            await self.send_json({
-                "type": "response.create",
-                "response": {
-                    "modalities": ["audio", "text"],
-                    "instructions": "Greet the caller and ask how you can help."
-                }
-            })
-    
-        async def close(self):
-            if self._recv_task:
-                self._recv_task.cancel()
-            if self.ws:
-                await self.ws.close()
-    
-        async def send_audio_pcm16_24k(self, pcm16_24k: bytes):
-            if not self.ws:
-                return
-            b64 = base64.b64encode(pcm16_24k).decode("utf-8")
-            await self.send_json({"type": "input_audio_buffer.append", "audio": b64})
+
     
         async def send_json(self, obj: dict):
             assert self.ws is not None
