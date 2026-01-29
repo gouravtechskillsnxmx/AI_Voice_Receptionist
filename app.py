@@ -300,6 +300,22 @@ def pcm16_8k_to_24k(pcm16_8k: bytes) -> bytes:
 def pcm16_24k_to_8k(pcm16_24k: bytes) -> bytes:
     return resample_pcm16_mono(pcm16_24k, 24000, 8000)
 
+
+def rms_pcm16(pcm16: bytes) -> float:
+    """RMS amplitude for PCM16 mono."""
+    if not pcm16:
+        return 0.0
+    # interpret as signed 16-bit little-endian
+    from array import array as _arr
+    a = _arr("h")
+    a.frombytes(pcm16)
+    if not a:
+        return 0.0
+    s2 = 0
+    for v in a:
+        s2 += int(v) * int(v)
+    return (s2 / len(a)) ** 0.5
+
 # -------------------------
 # Exotel session bridge
 # -------------------------
@@ -475,6 +491,29 @@ class ExotelSession:
                 return
 
             pcm8k = base64.b64decode(payload)
+
+            # Energy VAD: detect speech vs silence even if Exotel streams continuously
+            # Tune threshold if needed (typical RMS for silence is very low)
+            now = time.time()
+            r = rms_pcm16(pcm8k)
+            # Threshold chosen conservatively; adjust 300-1200 depending on your line/noise
+            if r >= 600:
+                self._speaking = True
+                self._last_speech_ts = now
+            else:
+                # If we were speaking and now we have ~0.6s of low energy, end-of-utterance => commit
+                if self._speaking and (now - self._last_speech_ts) >= 0.6:
+                    self._speaking = False
+                    # Guard against spamming commits
+                    if (now - self._last_commit_ts) >= 0.8 and self._ai_ready.is_set() and not self._committing:
+                        self._committing = True
+                        try:
+                            await self.openai.commit_and_respond()
+                        finally:
+                            self._committing = False
+                            self._committed_once = True
+                            self._last_commit_ts = now
+            # Energy VAD end
 
             if not self._ai_started:
                 await self._ensure_ai_started()
