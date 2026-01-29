@@ -6,6 +6,8 @@ import hashlib
 import base64
 import asyncio
 import datetime as dt
+import logging
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Callable
 
@@ -68,6 +70,9 @@ class Settings:
     OPENAI_TTS_GREETING: str = os.getenv("OPENAI_TTS_GREETING", "Hello! Thanks for calling. How can I help you today?")
 
 settings = Settings()
+
+logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'))
+logger = logging.getLogger('voicebridge')
 
 DEFAULT_SYSTEM_PROMPT = """You are an AI voice receptionist for a local business.
 Goals:
@@ -242,6 +247,11 @@ class OpenAIRealtimeClient:
                 continue
 
             et = event.get("type", "")
+            if et in ('error','session.created','session.updated','response.created','response.done'):
+                try:
+                    logger.info('OpenAI evt: %s', et)
+                except Exception:
+                    pass
             if et == "response.output_audio.delta":
                 delta_b64 = event.get("delta")
                 if delta_b64 and self.on_audio_delta:
@@ -428,7 +438,12 @@ class ExotelSession:
         self.openai.on_transcript = on_transcript
 
         prompt = (self.tenant.system_prompt or "").strip() or DEFAULT_SYSTEM_PROMPT
-        await self.openai.connect(system_prompt=prompt)
+        try:
+            await self.openai.connect(system_prompt=prompt)
+        except Exception as e:
+            logger.exception('OpenAI connect failed: %r', e)
+            # Do not crash the Exotel WS immediately; just keep connection open.
+            return
 
     async def _watch_commit(self):
         try:
@@ -452,7 +467,11 @@ class ExotelSession:
             return
 
     async def handle_event(self, event: dict):
-        et = (event.get("event") or event.get("type") or "").lower()
+        et = (event.get('event') or event.get('type') or '').lower()
+        try:
+            logger.info('WS IN event=%s first200=%s', et, (json.dumps(event)[:200] if isinstance(event, dict) else str(event)[:200]))
+        except Exception:
+            pass
 
         if et == "start":
             s = event.get("start") or {}
@@ -677,6 +696,7 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
     tenant = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_norm).first()
 
     if not tenant:
+        logger.warning("Unknown tenant for to_number=%s", to_norm)
         await websocket.send_text(json.dumps({"event": "error", "message": "Unknown tenant"}))
         await websocket.close()
         return
@@ -685,26 +705,35 @@ async def exotel_ws_path(websocket: WebSocket, to_number: str, db: Session = Dep
 
     try:
         while True:
-            msg = await websocket.receive()
-            raw = None
-            if "text" in msg and msg["text"] is not None:
-                raw = msg["text"]
-            elif "bytes" in msg and msg["bytes"] is not None:
-                raw = msg["bytes"].decode("utf-8", errors="ignore")
+            try:
+                raw = await websocket.receive_text()
+            except WebSocketDisconnect:
+                raise
+            except RuntimeError as e:
+                # Starlette raises when receive is called after disconnect
+                logger.info("WS runtime disconnect: %r", e)
+                raise WebSocketDisconnect()
+            except Exception as e:
+                logger.exception("WS receive_text error: %r", e)
+                await asyncio.sleep(0.05)
+                continue
 
-            if raw is None:
+            if not raw:
                 continue
 
             try:
                 event = json.loads(raw)
             except Exception:
+                logger.info("Non-JSON WS message first200=%s", raw[:200])
                 continue
 
             await session.handle_event(event)
 
     except WebSocketDisconnect:
+        logger.info("WS disconnected")
         await session.finish(status="disconnected")
-    except Exception:
+    except Exception as e:
+        logger.exception("WS handler crashed: %r", e)
         await session.finish(status="error")
         try:
             await websocket.close()
