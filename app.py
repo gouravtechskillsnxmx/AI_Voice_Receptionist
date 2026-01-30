@@ -625,7 +625,7 @@ async def exotel_media_ws(ws: WebSocket):
 
         # Start a background task to forward OpenAI audio deltas back to Exotel
         async def pump_openai_to_exotel():
-            nonlocal speaking
+            nonlocal speaking, response_active, drop_bot_audio_until
             tts_dump: bytearray = bytearray()  # optional recorder
 
             try:
@@ -636,6 +636,12 @@ async def exotel_media_ws(ws: WebSocket):
 
                         if etype == "response.audio.delta":
                             chunk_b64 = evt.get("delta")
+
+                            # Mark response active and drop any queued audio after barge-in
+                            response_active = True
+                            _t_now = asyncio.get_event_loop().time()
+                            if drop_bot_audio_until and _t_now < drop_bot_audio_until:
+                                continue
                             if chunk_b64 and ws.client_state.name != "DISCONNECTED":
                                 # --- decode OpenAI 24k PCM16 ---
                                 pcm24 = base64.b64decode(chunk_b64)
@@ -658,8 +664,12 @@ async def exotel_media_ws(ws: WebSocket):
                                 }))
                                 logger.info("WS OUT media stream_sid=%s bytes=%d", stream_sid, len(pcm8))
 
-                        elif etype == "response.completed":
+                        elif etype in ("response.created",):
+                            response_active = True
+
+                        elif etype in ("response.audio.done", "response.done", "response.completed"):
                             speaking = False
+                            response_active = False
 
                         elif etype == "error":
                             # Some errors (e.g. cancel when no active response) are non-fatal.
@@ -735,6 +745,8 @@ async def exotel_media_ws(ws: WebSocket):
 
     speaking: bool = False  # for optional hard barge-in
 
+    response_active: bool = False  # True when an OpenAI response is in-flight
+    drop_bot_audio_until: float = 0.0  # local clock; drop queued bot audio after barge-in
     try:
         while True:
             raw = await ws.receive_text()
@@ -803,13 +815,17 @@ async def exotel_media_ws(ws: WebSocket):
 
                     _now = asyncio.get_event_loop().time()
 
-                    # Hard barge-in: if user starts speaking while bot is speaking, cancel bot
-                    if speaking and _energy >= ENERGY_THRESHOLD:
+                    # Hard barge-in: if user starts speaking while bot is speaking or response is active, cancel immediately
+                    if _energy >= ENERGY_THRESHOLD and (speaking or response_active):
+                        # Drop any already-queued deltas for a short window (Exotel may have a tiny buffer)
+                        drop_bot_audio_until = _now + 0.35
                         try:
                             await openai_ws.send_json({"type": "response.cancel"})
                         except Exception:
                             pass
                         speaking = False
+                        response_active = False
+
 
                     # If we have buffered turn and silence lasted long enough -> commit + respond
                     if accum_turn_ms > 0 and (_now - last_non_silent_time) * 1000.0 >= float(SILENCE_TIMEOUT_MS):
