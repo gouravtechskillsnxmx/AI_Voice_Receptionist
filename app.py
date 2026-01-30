@@ -590,7 +590,7 @@ async def exotel_media_ws(ws: WebSocket):
 
     # Manual turn detection params (used only when FULL_DUPLEX=1)
     ENERGY_THRESHOLD = int(os.getenv("ENERGY_THRESHOLD", "120"))  # adjust if needed
-    SILENCE_TIMEOUT_MS = int(os.getenv("SILENCE_TIMEOUT_MS", "1000"))
+    SILENCE_TIMEOUT_MS = int(os.getenv("SILENCE_TIMEOUT_MS", "600"))
     MIN_TURN_MS = int(os.getenv("MIN_TURN_MS", "150"))
 
     last_non_silent_time: float = 0.0
@@ -763,22 +763,9 @@ async def exotel_media_ws(ws: WebSocket):
                     except Exception as _ge:
                         logger.exception("Greeting send failed: %s", _ge)
 
-                # ---- Speak greeting immediately once stream_sid is known ----
-                # This avoids losing the first audio deltas before Exotel provides stream_sid.
-                if greet_pending and openai_ws is not None and (not openai_ws.closed) and stream_sid:
-                    try:
-                        await openai_ws.send_json({
-                            "type": "response.create",
-                            "response": {
-                                "modalities": ["audio"],
-                                "instructions": _greet_text,
-                            },
-                        })
-                        greet_pending = False
-                        logger.info("Greeting triggered (tenant_id=%s to=%s)", tenant_id, to_number)
-                    except Exception as _ge:
-                        logger.exception("Greeting send failed: %s", _ge)
-
+                # ---- Duplicate greeting block disabled ----
+                # Reason: OpenAI Realtime does not support modalities ["audio"] alone.
+                # The valid greeting is sent above with modalities ["text","audio"].
             elif etype == "media":
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
