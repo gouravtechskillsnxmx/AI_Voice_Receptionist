@@ -529,12 +529,14 @@ async def exotel_media_ws(ws: WebSocket):
     to_number = (ws.query_params.get("to") or "").strip()
     tenant_prompt = None
     tenant_id = None
+    tenant_name = None
     try:
         db = SessionLocal()
         if to_number:
             t = db.query(Tenant).filter(Tenant.exotel_virtual_number == to_number).first()
             if t:
                 tenant_id = t.id
+                tenant_name = (t.name or "").strip() or None
                 tenant_prompt = (t.system_prompt or "").strip() or None
     except Exception as _e:
         logger.exception("Tenant lookup failed: %s", _e)
@@ -566,6 +568,21 @@ async def exotel_media_ws(ws: WebSocket):
     openai_session: Optional[ClientSession] = None
     openai_ws = None
     openai_reader_task: Optional[asyncio.Task] = None
+
+    # If you have ONE Exotel number for multiple demos, greet + ask routing.
+    # (Does not change any existing variables/flow; only triggers one initial response.)
+    AUTO_GREETING = os.getenv("AUTO_GREETING", "1") == "1"
+    greet_pending: bool = AUTO_GREETING
+    if tenant_id:
+        _greet_text = (
+            f"Welcome to {tenant_name or 'our office'} AI Reception. "
+            "How can I help you today?"
+        )
+    else:
+        _greet_text = (
+            "Welcome to GouravNxMx AI Reception. "
+            "Are you calling for Salon, CA, or Insurance? You can say the name."
+        )
 
     async def openai_connect():
         """Open the Realtime WS to OpenAI and configure the session for PCM16 + English."""
@@ -711,6 +728,22 @@ async def exotel_media_ws(ws: WebSocket):
                 mf = start_obj.get("media_format") or {}
                 sample_rate = int(mf.get("sample_rate") or sample_rate)
                 logger.info("Exotel stream started sid=%s sr=%d", stream_sid, sample_rate)
+
+                # ---- Speak greeting immediately once stream_sid is known ----
+                # This avoids losing the first audio deltas before Exotel provides stream_sid.
+                if greet_pending and openai_ws is not None and (not openai_ws.closed) and stream_sid:
+                    try:
+                        await openai_ws.send_json({
+                            "type": "response.create",
+                            "response": {
+                                "modalities": ["audio"],
+                                "instructions": _greet_text,
+                            },
+                        })
+                        greet_pending = False
+                        logger.info("Greeting triggered (tenant_id=%s to=%s)", tenant_id, to_number)
+                    except Exception as _ge:
+                        logger.exception("Greeting send failed: %s", _ge)
 
             elif etype == "media":
                 media = evt.get("media") or {}
