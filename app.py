@@ -736,7 +736,8 @@ async def exotel_media_ws(ws: WebSocket):
                         await openai_ws.send_json({
                             "type": "response.create",
                             "response": {
-                                "modalities": ["audio"],
+                                # Realtime does not allow audio-only; supported: ["text"] or ["text","audio"].
+                                "modalities": ["text", "audio"],
                                 "instructions": _greet_text,
                             },
                         })
