@@ -662,6 +662,14 @@ async def exotel_media_ws(ws: WebSocket):
                             speaking = False
 
                         elif etype == "error":
+                            # Some errors (e.g. cancel when no active response) are non-fatal.
+                            try:
+                                _code = ((evt.get("error") or {}).get("code") or "").strip()
+                            except Exception:
+                                _code = ""
+                            if _code == "response_cancel_not_active":
+                                logger.warning("OpenAI non-fatal error (ignored): %s", evt)
+                                continue
                             logger.error("OpenAI error: %s", evt)
                             break
 
