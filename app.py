@@ -581,8 +581,21 @@ async def exotel_media_ws(ws: WebSocket):
     else:
         _greet_text = (
             "Welcome to GouravNxMx AI Reception. "
-            "Are you calling for Salon, CA, or Insurance? You can say the name."
+            "Are you calling for Salon, Charted Accountant, or Insurance? You can say the name."
         )
+
+    # ---------------- Full-duplex controls (optional) ----------------
+    # Keep default OFF so existing working server-VAD flow stays unchanged.
+    FULL_DUPLEX = os.getenv("FULL_DUPLEX", "0") == "1"
+
+    # Manual turn detection params (used only when FULL_DUPLEX=1)
+    ENERGY_THRESHOLD = int(os.getenv("ENERGY_THRESHOLD", "120"))  # adjust if needed
+    SILENCE_TIMEOUT_MS = int(os.getenv("SILENCE_TIMEOUT_MS", "1000"))
+    MIN_TURN_MS = int(os.getenv("MIN_TURN_MS", "150"))
+
+    last_non_silent_time: float = 0.0
+    accum_turn_ms: float = 0.0
+
 
     async def openai_connect():
         """Open the Realtime WS to OpenAI and configure the session for PCM16 + English."""
@@ -599,12 +612,12 @@ async def exotel_media_ws(ws: WebSocket):
             "session": {
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": {
+                "turn_detection": (None if FULL_DUPLEX else {
                     "type": "server_vad",
                     "threshold": 0.5,
                     "prefix_padding_ms": 200,
                     "silence_duration_ms": silence_duration_ms
-                },
+                }),
                 "voice": "verse",
                 "instructions": (tenant_prompt or "You are a concise helpful voice agent. Always respond in English (Indian English). Keep answers short."),
             }
@@ -709,7 +722,8 @@ async def exotel_media_ws(ws: WebSocket):
                 })
                 last_audio_time = asyncio.get_event_loop().time()  # Reset
 
-    silence_check_task = asyncio.create_task(silence_checker())
+    if not FULL_DUPLEX:
+        silence_check_task = asyncio.create_task(silence_checker())
 
     speaking: bool = False  # for optional hard barge-in
 
@@ -729,6 +743,26 @@ async def exotel_media_ws(ws: WebSocket):
                 sample_rate = int(mf.get("sample_rate") or sample_rate)
                 logger.info("Exotel stream started sid=%s sr=%d", stream_sid, sample_rate)
 
+                # Initialize duplex timers
+                if FULL_DUPLEX:
+                    last_non_silent_time = asyncio.get_event_loop().time()
+                    accum_turn_ms = 0.0
+
+                # Speak greeting once, after stream_sid is known (Exotel needs it for outbound media)
+                if greet_pending and openai_ws is not None and (not openai_ws.closed) and stream_sid:
+                    try:
+                        await openai_ws.send_json({
+                            "type": "response.create",
+                            "response": {
+                                "modalities": ["text", "audio"],
+                                "instructions": _greet_text,
+                            },
+                        })
+                        greet_pending = False
+                        logger.info("Greeting triggered (tenant_id=%s to=%s)", tenant_id, to_number)
+                    except Exception as _ge:
+                        logger.exception("Greeting send failed: %s", _ge)
+
                 # ---- Speak greeting immediately once stream_sid is known ----
                 # This avoids losing the first audio deltas before Exotel provides stream_sid.
                 if greet_pending and openai_ws is not None and (not openai_ws.closed) and stream_sid:
@@ -736,8 +770,7 @@ async def exotel_media_ws(ws: WebSocket):
                         await openai_ws.send_json({
                             "type": "response.create",
                             "response": {
-                                # Realtime does not allow audio-only; supported: ["text"] or ["text","audio"].
-                                "modalities": ["text", "audio"],
+                                "modalities": ["audio"],
                                 "instructions": _greet_text,
                             },
                         })
@@ -764,6 +797,50 @@ async def exotel_media_ws(ws: WebSocket):
                 except Exception:
                     logger.warning("Invalid base64 in media payload")
                     continue
+
+                # FULL_DUPLEX mode: manual turn detection + barge-in
+                if FULL_DUPLEX:
+                    try:
+                        _samples16 = np.frombuffer(audio_bytes, dtype=np.int16)
+                        _energy = int(np.max(np.abs(_samples16))) if _samples16.size else 0
+                    except Exception:
+                        _energy = 0
+
+                    _now = asyncio.get_event_loop().time()
+
+                    # Hard barge-in: if user starts speaking while bot is speaking, cancel bot
+                    if speaking and _energy >= ENERGY_THRESHOLD:
+                        try:
+                            await openai_ws.send_json({"type": "response.cancel"})
+                        except Exception:
+                            pass
+                        speaking = False
+
+                    # If we have buffered turn and silence lasted long enough -> commit + respond
+                    if accum_turn_ms > 0 and (_now - last_non_silent_time) * 1000.0 >= float(SILENCE_TIMEOUT_MS):
+                        if accum_turn_ms >= float(MIN_TURN_MS):
+                            await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                            await openai_ws.send_json({
+                                "type": "response.create",
+                                "response": {
+                                    "modalities": ["text", "audio"],
+                                    "instructions": "Reply in English only. Keep it short."
+                                }
+                            })
+                        accum_turn_ms = 0.0
+                        last_non_silent_time = _now
+
+                    # Ignore silent frames
+                    if _energy < ENERGY_THRESHOLD:
+                        continue
+
+                    # Non-silent: update turn timing
+                    last_non_silent_time = _now
+                    try:
+                        _frame_ms = (len(audio_bytes) / float(bytes_per_sample) / float(sample_rate)) * 1000.0
+                    except Exception:
+                        _frame_ms = 0.0
+                    accum_turn_ms += _frame_ms
 
                 # Resample if needed
                 if sample_rate != target_sr:
@@ -802,6 +879,17 @@ async def exotel_media_ws(ws: WebSocket):
 
             elif etype == "stop":
                 logger.info("Exotel stream stopped sid=%s", stream_sid)
+                # If caller hangs up mid-turn in FULL_DUPLEX, try to commit what we have (best-effort)
+                if FULL_DUPLEX and openai_ws is not None and (not openai_ws.closed):
+                    try:
+                        if accum_turn_ms >= float(MIN_TURN_MS):
+                            await openai_ws.send_json({"type": "input_audio_buffer.commit"})
+                            await openai_ws.send_json({
+                                "type": "response.create",
+                                "response": {"modalities": ["text", "audio"]}
+                            })
+                    except Exception:
+                        pass
                 break
 
     except WebSocketDisconnect:
