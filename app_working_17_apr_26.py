@@ -147,7 +147,6 @@ import wave
 import time
 
 SAVE_TTS_WAV = os.getenv("SAVE_TTS_WAV", "0") == "1"
-OPENAI_MAX_TALK_SECONDS = int(os.getenv("OPENAI_MAX_TALK_SECONDS", "180"))
 
 # ---- audio resampling helper (audioop removed in Python 3.13) ----
 def _audio_ratecv(pcm: bytes, inrate: int, outrate: int) -> bytes:
@@ -569,9 +568,6 @@ async def exotel_media_ws(ws: WebSocket):
     openai_session: Optional[ClientSession] = None
     openai_ws = None
     openai_reader_task: Optional[asyncio.Task] = None
-    openai_started_at: float = 0.0
-    openai_timeout_task: Optional[asyncio.Task] = None
-    openai_timed_out: bool = False
 
     # If you have ONE Exotel number for multiple demos, greet + ask routing.
     # (Does not change any existing variables/flow; only triggers one initial response.)
@@ -601,56 +597,14 @@ async def exotel_media_ws(ws: WebSocket):
     accum_turn_ms: float = 0.0
 
 
-    async def close_openai_for_timeout(reason: str = "timeout"):
-        """Close only the OpenAI realtime side after configured talk duration."""
-        nonlocal openai_timed_out, openai_ws, openai_session, openai_reader_task, openai_timeout_task
-        if openai_timed_out:
-            return
-        openai_timed_out = True
-        logger.warning("Closing OpenAI realtime due to %s after %s seconds", reason, OPENAI_MAX_TALK_SECONDS)
-        try:
-            if openai_timeout_task and not openai_timeout_task.done():
-                openai_timeout_task.cancel()
-        except Exception:
-            pass
-        try:
-            if openai_reader_task and not openai_reader_task.done():
-                openai_reader_task.cancel()
-        except Exception:
-            pass
-        try:
-            if openai_ws and not openai_ws.closed:
-                await openai_ws.close()
-        except Exception:
-            pass
-        try:
-            if openai_session:
-                await openai_session.close()
-        except Exception:
-            pass
-
     async def openai_connect():
         """Open the Realtime WS to OpenAI and configure the session for PCM16 + English."""
-        nonlocal openai_session, openai_ws, openai_reader_task, openai_started_at, openai_timeout_task, openai_timed_out
+        nonlocal openai_session, openai_ws, openai_reader_task
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
         openai_session = ClientSession()
         openai_ws = await openai_session.ws_connect(url, headers=headers)
-        openai_started_at = asyncio.get_event_loop().time()
-        openai_timed_out = False
-        logger.info("OpenAI realtime connected; talk timeout=%s seconds", OPENAI_MAX_TALK_SECONDS)
-
-        async def _openai_timeout_enforcer():
-            try:
-                await asyncio.sleep(OPENAI_MAX_TALK_SECONDS)
-                await close_openai_for_timeout("max_talk_seconds")
-            except asyncio.CancelledError:
-                pass
-            except Exception as _timeout_err:
-                logger.exception("OpenAI timeout task error: %s", _timeout_err)
-
-        openai_timeout_task = asyncio.create_task(_openai_timeout_enforcer())
 
         # Configure session once (PCM16 both ways, English-only instructions)
         await openai_ws.send_json({
@@ -687,8 +641,6 @@ async def exotel_media_ws(ws: WebSocket):
                             response_active = True
                             _t_now = asyncio.get_event_loop().time()
                             if drop_bot_audio_until and _t_now < drop_bot_audio_until:
-                                continue
-                            if openai_timed_out:
                                 continue
                             if chunk_b64 and ws.client_state.name != "DISCONNECTED":
                                 # --- decode OpenAI 24k PCM16 ---
@@ -753,11 +705,6 @@ async def exotel_media_ws(ws: WebSocket):
         """Gracefully close OpenAI WS and session."""
         if silence_check_task:
             silence_check_task.cancel()
-        try:
-            if openai_timeout_task and not openai_timeout_task.done():
-                openai_timeout_task.cancel()
-        except Exception:
-            pass
         try:
             if openai_reader_task and not openai_reader_task.done():
                 openai_reader_task.cancel()
@@ -843,14 +790,6 @@ async def exotel_media_ws(ws: WebSocket):
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload")
                 if not payload_b64:
-                    continue
-
-                if openai_timed_out:
-                    logger.info("OpenAI talk timeout reached; ignoring caller audio")
-                    continue
-
-                if openai_started_at and (asyncio.get_event_loop().time() - openai_started_at) >= float(OPENAI_MAX_TALK_SECONDS):
-                    await close_openai_for_timeout("inline_media_guard")
                     continue
 
                 if openai_ws is None or openai_ws.closed:
